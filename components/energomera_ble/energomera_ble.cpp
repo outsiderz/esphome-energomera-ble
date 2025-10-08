@@ -7,17 +7,13 @@ namespace energomera_ble {
 static const char *const TAG = "energomera_ble";
 
 void EnergomeraBleComponent::setup() {
-  ESP_LOGI(TAG, "Setting up Energomera BLE component...");
-
-  // Bonding сохраняем — не вызываем remove_bonding()
-
-  // Подключаемся
-  this->try_connect();
+  ESP_LOGI(TAG, "Energomera BLE setup");
+  this->set_state_(FsmState::START);
 }
 
 void EnergomeraBleComponent::loop() {
-  // Watchdog FSM
-  watchdog_();
+  // Watchdog для внутренней логики
+  this->watchdog_();
 
   // --- 1. Автоматическое восстановление соединения ---
   static uint32_t last_reconnect_attempt = 0;
@@ -28,16 +24,16 @@ void EnergomeraBleComponent::loop() {
       this->try_connect();
       last_reconnect_attempt = now;
     }
-    return;  // пока не переподключимся, не продолжаем
+    return;
   }
 
-  // --- 2. Keep-alive запрос раз в 30 секунд ---
+  // --- 2. Keep-alive запрос каждые 30 секунд ---
   static uint32_t last_keepalive = 0;
   if (this->state_ == FsmState::IDLE) {
     uint32_t now = millis();
     if (now - last_keepalive > 30000) {  // каждые 30 сек
-      ESP_LOGD(TAG, "Sending keep-alive request (VER)");
-      this->prepare_request_("VER");      // безопасная команда
+      ESP_LOGD(TAG, "Sending keep-alive request");
+      this->prepare_request_("VER");  // безопасный короткий запрос версии
       this->send_next_fragment_();
       last_keepalive = now;
     }
@@ -45,8 +41,29 @@ void EnergomeraBleComponent::loop() {
 }
 
 void EnergomeraBleComponent::update() {
-  ESP_LOGV(TAG, "Polling Energomera...");
-  // стандартная логика опроса
+  // Периодическое опросное обновление
+  if (this->state_ == FsmState::IDLE) {
+    ESP_LOGD(TAG, "Polling sensors...");
+    for (auto &it : this->sensors_) {
+      ValueRefsArray vals{};
+      if (this->set_sensor_value_(it.second, vals)) {
+        it.second->publish_state(atof(vals[0]));
+      }
+    }
+  }
+}
+
+void EnergomeraBleComponent::try_connect() {
+  if (this->address_set_) {
+    ESP_LOGI(TAG, "Trying to connect to Energomera meter...");
+    this->connect();  // ✅ исправлено (вместо ble_client::BLEClientNode::connect)
+  } else {
+    ESP_LOGW(TAG, "No BLE address set, cannot connect");
+  }
+}
+
+void EnergomeraBleComponent::remove_bonding() {
+  ESP_LOGW(TAG, "Bonding removal disabled (for stable reconnects)");
 }
 
 void EnergomeraBleComponent::gattc_event_handler(esp_gattc_cb_event_t event,
@@ -56,15 +73,15 @@ void EnergomeraBleComponent::gattc_event_handler(esp_gattc_cb_event_t event,
     case ESP_GATTC_CONNECT_EVT: {
       ESP_LOGI(TAG, "Connected to Energomera, configuring connection...");
 
-      // Увеличиваем MTU (максимум для BLE 4.2+)
-      esp_ble_gattc_set_local_mtu(gattc_if, 247);
+      // ✅ Исправлено: используем правильный вызов для ESP-IDF 5.4+
+      esp_ble_gatt_set_local_mtu(247);
 
-      // Настраиваем параметры соединения для большей стабильности
       esp_bd_addr_t peer_addr;
       memcpy(peer_addr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-      esp_ble_gap_set_prefer_conn_params(peer_addr, 24, 40, 0, 600); // timeout 6 сек
 
-      // Продолжаем FSM
+      // Настраиваем параметры соединения
+      esp_ble_gap_set_prefer_conn_params(peer_addr, 24, 40, 0, 600);
+
       this->state_ = FsmState::START;
       this->characteristics_resolved_ = false;
       this->notifications_enabled_ = false;
@@ -81,18 +98,6 @@ void EnergomeraBleComponent::gattc_event_handler(esp_gattc_cb_event_t event,
       this->state_ = FsmState::DISCONNECTED;
       break;
 
-    case ESP_GATTC_SEARCH_RES_EVT:
-      ESP_LOGD(TAG, "Service discovered");
-      break;
-
-    case ESP_GATTC_NOTIFY_EVT:
-      this->handle_notification_(param->notify);
-      break;
-
-    case ESP_GATTC_READ_CHAR_EVT:
-      this->handle_command_read_(param->read);
-      break;
-
     default:
       break;
   }
@@ -103,12 +108,11 @@ void EnergomeraBleComponent::gap_event_handler(esp_gap_ble_cb_event_t event,
   switch (event) {
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
       if (param->ble_security.auth_cmpl.success) {
-        ESP_LOGI(TAG, "BLE bonding complete, encrypted link ready");
+        ESP_LOGI(TAG, "BLE pairing successful");
         this->link_encrypted_ = true;
       } else {
-        ESP_LOGW(TAG, "BLE authentication failed, will retry");
+        ESP_LOGW(TAG, "BLE pairing failed, will retry");
         this->link_encrypted_ = false;
-        this->state_ = FsmState::DISCONNECTED;
       }
       break;
 
@@ -117,24 +121,44 @@ void EnergomeraBleComponent::gap_event_handler(esp_gap_ble_cb_event_t event,
   }
 }
 
-void EnergomeraBleComponent::try_connect() {
-  if (this->address_set_) {
-    ESP_LOGI(TAG, "Trying to connect to Energomera meter...");
-    ble_client::BLEClientNode::connect();
-  } else {
-    ESP_LOGW(TAG, "No BLE address set, cannot connect");
-  }
+void EnergomeraBleComponent::register_sensor(EnergomeraBleSensorBase *sensor) {
+  this->sensors_.insert({sensor->get_sensor_code(), sensor});
+}
+
+void EnergomeraBleComponent::dump_config() {
+  ESP_LOGCONFIG(TAG, "Energomera BLE Component:");
+  ESP_LOGCONFIG(TAG, "  Number of sensors: %u", (unsigned) this->sensors_.size());
+  ESP_LOGCONFIG(TAG, "  Passkey: %06u", this->passkey_);
+  ESP_LOGCONFIG(TAG, "  State: %s", this->state_to_string_(this->state_));
 }
 
 void EnergomeraBleComponent::watchdog_() {
-  // Следим за зависанием FSM
-  static uint32_t last_activity = 0;
-  if (this->state_ != FsmState::DISCONNECTED) {
-    if (millis() - last_activity > 60000) {  // 1 минута бездействия
-      ESP_LOGW(TAG, "No BLE activity detected, resetting connection...");
-      this->state_ = FsmState::DISCONNECTED;
-      last_activity = millis();
-    }
+  // Можно добавить защиту от зависания FSM
+  if (this->state_ == FsmState::ERROR) {
+    ESP_LOGW(TAG, "Watchdog restarting BLE state machine...");
+    this->state_ = FsmState::DISCONNECTED;
+  }
+}
+
+const char *EnergomeraBleComponent::state_to_string_(FsmState state) const {
+  switch (state) {
+    case FsmState::NOT_INITIALIZED: return "NOT_INITIALIZED";
+    case FsmState::IDLE: return "IDLE";
+    case FsmState::START: return "START";
+    case FsmState::RESOLVING: return "RESOLVING";
+    case FsmState::REQUESTING_FIRMWARE: return "REQUESTING_FIRMWARE";
+    case FsmState::WAITING_FIRMWARE: return "WAITING_FIRMWARE";
+    case FsmState::ENABLING_NOTIFICATION: return "ENABLING_NOTIFICATION";
+    case FsmState::WAITING_NOTIFICATION_ENABLE: return "WAITING_NOTIFICATION_ENABLE";
+    case FsmState::PREPARING_COMMAND: return "PREPARING_COMMAND";
+    case FsmState::SENDING_COMMAND: return "SENDING_COMMAND";
+    case FsmState::WAITING_NOTIFICATION: return "WAITING_NOTIFICATION";
+    case FsmState::READING_RESPONSE: return "READING_RESPONSE";
+    case FsmState::GOT_RESPONSE: return "GOT_RESPONSE";
+    case FsmState::PUBLISH: return "PUBLISH";
+    case FsmState::ERROR: return "ERROR";
+    case FsmState::DISCONNECTED: return "DISCONNECTED";
+    default: return "UNKNOWN";
   }
 }
 
