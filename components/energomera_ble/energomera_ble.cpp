@@ -1,5 +1,6 @@
 #include "energomera_ble.h"
 
+
 #include "esphome/core/log.h"
 
 #include <algorithm>
@@ -9,8 +10,7 @@
 #include <cstring>
 #include <sstream>
 
-#include "esp32_ble_client/esp32_ble_client.h"
-#include "energomera_ble/energomera_ble.h"
+
 
 #include <esp_gatt_defs.h>
 #include <esp_heap_caps.h>
